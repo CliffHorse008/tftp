@@ -104,6 +104,81 @@ static void log_client(const struct sockaddr_in *addr, const char *message) {
     fprintf(stderr, "[%s:%u] %s\n", ip, ntohs(addr->sin_port), message);
 }
 
+struct transfer_meter {
+    const char *direction;
+    const char *filename;
+    off_t total_bytes;
+    size_t transferred_bytes;
+    size_t next_report_bytes;
+    unsigned next_report_percent;
+};
+
+static void init_transfer_meter(struct transfer_meter *meter, const char *direction, const char *filename, off_t total_bytes) {
+    meter->direction = direction;
+    meter->filename = filename;
+    meter->total_bytes = total_bytes;
+    meter->transferred_bytes = 0;
+    meter->next_report_bytes = 64 * 1024;
+    meter->next_report_percent = 10;
+}
+
+static void log_transfer_progress(const struct sockaddr_in *addr, struct transfer_meter *meter, size_t delta_bytes, bool done) {
+    char message[384];
+
+    meter->transferred_bytes += delta_bytes;
+
+    bool should_log = done;
+    unsigned long long percent = 0;
+    if (meter->total_bytes > 0) {
+        percent = (unsigned long long)(((uint64_t)meter->transferred_bytes * 100) / (uint64_t)meter->total_bytes);
+        if (percent > 100) {
+            percent = 100;
+        }
+
+        if (!should_log && percent >= meter->next_report_percent) {
+            should_log = true;
+            while (meter->next_report_percent <= percent && meter->next_report_percent < 100) {
+                meter->next_report_percent += 10;
+            }
+        }
+    } else if (!should_log && meter->transferred_bytes >= meter->next_report_bytes) {
+        should_log = true;
+        while (meter->next_report_bytes <= meter->transferred_bytes) {
+            meter->next_report_bytes += 64 * 1024;
+        }
+    }
+
+    if (!should_log) {
+        return;
+    }
+
+    if (meter->total_bytes > 0) {
+        snprintf(
+            message,
+            sizeof(message),
+            "%s progress for %s: %zu/%lld bytes (%llu%%)%s",
+            meter->direction,
+            meter->filename,
+            meter->transferred_bytes,
+            (long long)meter->total_bytes,
+            percent,
+            done ? ", completed" : ""
+        );
+    } else {
+        snprintf(
+            message,
+            sizeof(message),
+            "%s progress for %s: %zu bytes%s",
+            meter->direction,
+            meter->filename,
+            meter->transferred_bytes,
+            done ? ", completed" : ""
+        );
+    }
+
+    log_client(addr, message);
+}
+
 static bool is_safe_filename(const char *filename) {
     if (filename[0] == '\0') {
         return false;
@@ -271,7 +346,13 @@ static int send_data(
     return sendto(sockfd, packet, 4 + data_len, 0, (const struct sockaddr *)client_addr, client_len);
 }
 
-static int handle_rrq(int sockfd, const struct sockaddr_in *client_addr, socklen_t client_len, const char *path) {
+static int handle_rrq(
+    int sockfd,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    const char *path,
+    const char *filename
+) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         if (errno == ENOENT) {
@@ -286,6 +367,13 @@ static int handle_rrq(int sockfd, const struct sockaddr_in *client_addr, socklen
     uint8_t data[TFTP_DATA_SIZE];
     uint8_t ack_packet[TFTP_PACKET_SIZE];
     bool done = false;
+    struct stat st;
+    off_t total_bytes = -1;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
+        total_bytes = st.st_size;
+    }
+    struct transfer_meter meter;
+    init_transfer_meter(&meter, "download", filename, total_bytes);
 
     while (!done) {
         ssize_t bytes_read = read(fd, data, sizeof(data));
@@ -332,6 +420,7 @@ static int handle_rrq(int sockfd, const struct sockaddr_in *client_addr, socklen
         }
 
         done = bytes_read < TFTP_DATA_SIZE;
+        log_transfer_progress(client_addr, &meter, (size_t)bytes_read, done);
         block++;
     }
 
@@ -339,7 +428,13 @@ static int handle_rrq(int sockfd, const struct sockaddr_in *client_addr, socklen
     return 0;
 }
 
-static int handle_wrq(int sockfd, const struct sockaddr_in *client_addr, socklen_t client_len, const char *path) {
+static int handle_wrq(
+    int sockfd,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    const char *path,
+    const char *filename
+) {
     char temp_path[576];
     int fd = open_upload_temp_file(path, temp_path, sizeof(temp_path));
     if (fd < 0) {
@@ -355,6 +450,8 @@ static int handle_wrq(int sockfd, const struct sockaddr_in *client_addr, socklen
 
     uint16_t expected_block = 1;
     uint8_t packet[TFTP_PACKET_SIZE];
+    struct transfer_meter meter;
+    init_transfer_meter(&meter, "upload", filename, -1);
 
     for (;;) {
         int retries = 0;
@@ -423,6 +520,7 @@ static int handle_wrq(int sockfd, const struct sockaddr_in *client_addr, socklen
                     return -1;
                 }
 
+                log_transfer_progress(client_addr, &meter, (size_t)data_len, true);
                 break;
             }
 
@@ -432,6 +530,7 @@ static int handle_wrq(int sockfd, const struct sockaddr_in *client_addr, socklen
                 return -1;
             }
 
+            log_transfer_progress(client_addr, &meter, (size_t)data_len, false);
             expected_block++;
             continue;
         }
@@ -457,7 +556,12 @@ static int handle_wrq(int sockfd, const struct sockaddr_in *client_addr, socklen
     return 0;
 }
 
-static void handle_request(const struct request_info *req, const struct sockaddr_in *client_addr, socklen_t client_len, const char *path) {
+static void handle_request(
+    const struct request_info *req,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    const char *path
+) {
     int transfer_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (transfer_sock < 0) {
         return;
@@ -480,9 +584,9 @@ static void handle_request(const struct request_info *req, const struct sockaddr
     }
 
     if (req->opcode == TFTP_RRQ) {
-        handle_rrq(transfer_sock, client_addr, client_len, path);
+        handle_rrq(transfer_sock, client_addr, client_len, path, req->filename);
     } else {
-        handle_wrq(transfer_sock, client_addr, client_len, path);
+        handle_wrq(transfer_sock, client_addr, client_len, path, req->filename);
     }
 
     close(transfer_sock);

@@ -60,6 +60,8 @@ tftp> binary
 tftp> get test.txt
 ```
 
+说明：很多系统自带的交互式 `tftp` 客户端不会显示下载进度条。当前服务端会把下载/上传进度打印到标准错误，例如 `download progress for test.txt: 4096/16384 bytes (25%)`。
+
 上传文件：
 
 ```bash
