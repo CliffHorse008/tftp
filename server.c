@@ -1,0 +1,621 @@
+#define _POSIX_C_SOURCE 200809L
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define TFTP_PORT 69
+#define TFTP_DATA_SIZE 512
+#define TFTP_PACKET_SIZE 516
+#define TFTP_RETRIES 5
+#define TFTP_TIMEOUT_SEC 3
+
+enum tftp_opcode {
+    TFTP_RRQ = 1,
+    TFTP_WRQ = 2,
+    TFTP_DATA = 3,
+    TFTP_ACK = 4,
+    TFTP_ERROR = 5,
+};
+
+enum tftp_error_code {
+    TFTP_ERR_UNDEFINED = 0,
+    TFTP_ERR_NOT_FOUND = 1,
+    TFTP_ERR_ACCESS = 2,
+    TFTP_ERR_DISK_FULL = 3,
+    TFTP_ERR_ILLEGAL_OP = 4,
+    TFTP_ERR_UNKNOWN_TID = 5,
+    TFTP_ERR_EXISTS = 6,
+    TFTP_ERR_NO_SUCH_USER = 7,
+};
+
+struct request_info {
+    uint16_t opcode;
+    char filename[256];
+    char mode[32];
+};
+
+static volatile sig_atomic_t g_running = 1;
+
+static int parse_port(const char *text, uint16_t *port) {
+    char *end = NULL;
+    long value = strtol(text, &end, 10);
+    if (text[0] == '\0' || end == NULL || *end != '\0') {
+        return -1;
+    }
+    if (value < 1 || value > 65535) {
+        return -1;
+    }
+
+    *port = (uint16_t)value;
+    return 0;
+}
+
+static void handle_signal(int signo) {
+    (void)signo;
+    g_running = 0;
+}
+
+static void reap_children(int signo) {
+    (void)signo;
+    while (waitpid(-1, NULL, WNOHANG) > 0) {
+    }
+}
+
+static size_t bounded_strlen(const char *s, size_t max_len) {
+    size_t i = 0;
+    while (i < max_len && s[i] != '\0') {
+        i++;
+    }
+    return i;
+}
+
+static uint16_t read_u16(const uint8_t *buf) {
+    uint16_t value;
+    memcpy(&value, buf, sizeof(value));
+    return ntohs(value);
+}
+
+static void write_u16(uint8_t *buf, uint16_t value) {
+    uint16_t net = htons(value);
+    memcpy(buf, &net, sizeof(net));
+}
+
+static void log_client(const struct sockaddr_in *addr, const char *message) {
+    char ip[INET_ADDRSTRLEN];
+    if (inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof(ip)) == NULL) {
+        snprintf(ip, sizeof(ip), "unknown");
+    }
+
+    fprintf(stderr, "[%s:%u] %s\n", ip, ntohs(addr->sin_port), message);
+}
+
+static bool is_safe_filename(const char *filename) {
+    if (filename[0] == '\0') {
+        return false;
+    }
+
+    if (filename[0] == '/' || strstr(filename, "..") != NULL) {
+        return false;
+    }
+
+    for (const char *p = filename; *p != '\0'; ++p) {
+        if (*p == '\\') {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static int build_path(char *dst, size_t dst_size, const char *root_dir, const char *filename) {
+    int written = snprintf(dst, dst_size, "%s/%s", root_dir, filename);
+    if (written < 0 || (size_t)written >= dst_size) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int open_upload_temp_file(const char *path, char *temp_path, size_t temp_path_size) {
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        int written = snprintf(temp_path, temp_path_size, "%s.tmp.%ld.%d", path, (long)getpid(), attempt);
+        if (written < 0 || (size_t)written >= temp_path_size) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+
+        int fd = open(temp_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (fd >= 0) {
+            return fd;
+        }
+
+        if (errno != EEXIST) {
+            return -1;
+        }
+    }
+
+    errno = EEXIST;
+    return -1;
+}
+
+static ssize_t send_error_packet(
+    int sockfd,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    uint16_t error_code,
+    const char *message
+) {
+    uint8_t packet[TFTP_PACKET_SIZE];
+    size_t msg_len = bounded_strlen(message, TFTP_PACKET_SIZE - 5);
+
+    write_u16(packet, TFTP_ERROR);
+    write_u16(packet + 2, error_code);
+    memcpy(packet + 4, message, msg_len);
+    packet[4 + msg_len] = '\0';
+
+    return sendto(sockfd, packet, 5 + msg_len, 0, (const struct sockaddr *)client_addr, client_len);
+}
+
+static int set_socket_timeout(int sockfd, int seconds) {
+    struct timeval tv;
+    tv.tv_sec = seconds;
+    tv.tv_usec = 0;
+
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int recv_expected_packet(
+    int sockfd,
+    uint8_t *buf,
+    size_t buf_size,
+    ssize_t *received_len,
+    const struct sockaddr_in *peer_addr
+) {
+    struct sockaddr_in src_addr;
+    socklen_t src_len = sizeof(src_addr);
+
+    *received_len = recvfrom(sockfd, buf, buf_size, 0, (struct sockaddr *)&src_addr, &src_len);
+    if (*received_len < 0) {
+        return -1;
+    }
+
+    if (src_addr.sin_addr.s_addr != peer_addr->sin_addr.s_addr || src_addr.sin_port != peer_addr->sin_port) {
+        send_error_packet(sockfd, &src_addr, src_len, TFTP_ERR_UNKNOWN_TID, "Unknown transfer ID");
+        errno = EPROTO;
+        return -2;
+    }
+
+    return 0;
+}
+
+static int parse_request(const uint8_t *packet, ssize_t len, struct request_info *req) {
+    if (len < 4) {
+        return -1;
+    }
+
+    req->opcode = read_u16(packet);
+    if (req->opcode != TFTP_RRQ && req->opcode != TFTP_WRQ) {
+        return -1;
+    }
+
+    size_t index = 2;
+    size_t filename_len = bounded_strlen((const char *)(packet + index), (size_t)len - index);
+    if (index + filename_len >= (size_t)len || filename_len == 0 || filename_len >= sizeof(req->filename)) {
+        return -1;
+    }
+
+    memcpy(req->filename, packet + index, filename_len);
+    req->filename[filename_len] = '\0';
+    index += filename_len + 1;
+
+    size_t mode_len = bounded_strlen((const char *)(packet + index), (size_t)len - index);
+    if (index + mode_len >= (size_t)len || mode_len == 0 || mode_len >= sizeof(req->mode)) {
+        return -1;
+    }
+
+    memcpy(req->mode, packet + index, mode_len);
+    req->mode[mode_len] = '\0';
+
+    if (strcasecmp(req->mode, "octet") != 0) {
+        return -2;
+    }
+
+    return 0;
+}
+
+static int send_ack(int sockfd, const struct sockaddr_in *client_addr, socklen_t client_len, uint16_t block) {
+    uint8_t packet[4];
+    write_u16(packet, TFTP_ACK);
+    write_u16(packet + 2, block);
+
+    return sendto(sockfd, packet, sizeof(packet), 0, (const struct sockaddr *)client_addr, client_len);
+}
+
+static int send_data(
+    int sockfd,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    uint16_t block,
+    const uint8_t *data,
+    size_t data_len
+) {
+    uint8_t packet[TFTP_PACKET_SIZE];
+    if (data_len > TFTP_DATA_SIZE) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    write_u16(packet, TFTP_DATA);
+    write_u16(packet + 2, block);
+    memcpy(packet + 4, data, data_len);
+
+    return sendto(sockfd, packet, 4 + data_len, 0, (const struct sockaddr *)client_addr, client_len);
+}
+
+static int handle_rrq(int sockfd, const struct sockaddr_in *client_addr, socklen_t client_len, const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        if (errno == ENOENT) {
+            send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_NOT_FOUND, "File not found");
+        } else {
+            send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_ACCESS, "Unable to open file");
+        }
+        return -1;
+    }
+
+    uint16_t block = 1;
+    uint8_t data[TFTP_DATA_SIZE];
+    uint8_t ack_packet[TFTP_PACKET_SIZE];
+    bool done = false;
+
+    while (!done) {
+        ssize_t bytes_read = read(fd, data, sizeof(data));
+        if (bytes_read < 0) {
+            send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_UNDEFINED, "Read failure");
+            close(fd);
+            return -1;
+        }
+
+        int retries = 0;
+        while (retries < TFTP_RETRIES) {
+            if (send_data(sockfd, client_addr, client_len, block, data, (size_t)bytes_read) < 0) {
+                close(fd);
+                return -1;
+            }
+
+            ssize_t recv_len = 0;
+            int recv_status = recv_expected_packet(sockfd, ack_packet, sizeof(ack_packet), &recv_len, client_addr);
+            if (recv_status == -2) {
+                continue;
+            }
+            if (recv_status < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    retries++;
+                    continue;
+                }
+                close(fd);
+                return -1;
+            }
+
+            if (recv_len == 4 && read_u16(ack_packet) == TFTP_ACK && read_u16(ack_packet + 2) == block) {
+                break;
+            }
+
+            if (recv_len >= 4 && read_u16(ack_packet) == TFTP_ERROR) {
+                close(fd);
+                return -1;
+            }
+        }
+
+        if (retries == TFTP_RETRIES) {
+            close(fd);
+            return -1;
+        }
+
+        done = bytes_read < TFTP_DATA_SIZE;
+        block++;
+    }
+
+    close(fd);
+    return 0;
+}
+
+static int handle_wrq(int sockfd, const struct sockaddr_in *client_addr, socklen_t client_len, const char *path) {
+    char temp_path[576];
+    int fd = open_upload_temp_file(path, temp_path, sizeof(temp_path));
+    if (fd < 0) {
+        send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_ACCESS, "Unable to create upload file");
+        return -1;
+    }
+
+    if (send_ack(sockfd, client_addr, client_len, 0) < 0) {
+        close(fd);
+        unlink(temp_path);
+        return -1;
+    }
+
+    uint16_t expected_block = 1;
+    uint8_t packet[TFTP_PACKET_SIZE];
+
+    for (;;) {
+        int retries = 0;
+        ssize_t recv_len = 0;
+
+        while (retries < TFTP_RETRIES) {
+            int recv_status = recv_expected_packet(sockfd, packet, sizeof(packet), &recv_len, client_addr);
+            if (recv_status == -2) {
+                continue;
+            }
+            if (recv_status < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    if (send_ack(sockfd, client_addr, client_len, (uint16_t)(expected_block - 1)) < 0) {
+                        close(fd);
+                        unlink(temp_path);
+                        return -1;
+                    }
+                    retries++;
+                    continue;
+                }
+                close(fd);
+                unlink(temp_path);
+                return -1;
+            }
+
+            break;
+        }
+
+        if (retries == TFTP_RETRIES) {
+            close(fd);
+            unlink(temp_path);
+            return -1;
+        }
+
+        if (recv_len < 4 || read_u16(packet) != TFTP_DATA) {
+            send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_ILLEGAL_OP, "Expected DATA packet");
+            close(fd);
+            unlink(temp_path);
+            return -1;
+        }
+
+        uint16_t block = read_u16(packet + 2);
+        if (block == expected_block) {
+            ssize_t data_len = recv_len - 4;
+            if (write(fd, packet + 4, (size_t)data_len) != data_len) {
+                send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_DISK_FULL, "Write failure");
+                close(fd);
+                unlink(temp_path);
+                return -1;
+            }
+
+            if (data_len < TFTP_DATA_SIZE) {
+                if (close(fd) < 0) {
+                    unlink(temp_path);
+                    return -1;
+                }
+                fd = -1;
+
+                if (rename(temp_path, path) < 0) {
+                    send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_ACCESS, "Unable to replace target file");
+                    unlink(temp_path);
+                    return -1;
+                }
+
+                if (send_ack(sockfd, client_addr, client_len, block) < 0) {
+                    return -1;
+                }
+
+                break;
+            }
+
+            if (send_ack(sockfd, client_addr, client_len, block) < 0) {
+                close(fd);
+                unlink(temp_path);
+                return -1;
+            }
+
+            expected_block++;
+            continue;
+        }
+
+        if (block == (uint16_t)(expected_block - 1)) {
+            if (send_ack(sockfd, client_addr, client_len, block) < 0) {
+                close(fd);
+                unlink(temp_path);
+                return -1;
+            }
+            continue;
+        }
+
+        send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_ILLEGAL_OP, "Unexpected block number");
+        close(fd);
+        unlink(temp_path);
+        return -1;
+    }
+
+    if (fd >= 0) {
+        close(fd);
+    }
+    return 0;
+}
+
+static void handle_request(const struct request_info *req, const struct sockaddr_in *client_addr, socklen_t client_len, const char *path) {
+    int transfer_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (transfer_sock < 0) {
+        return;
+    }
+
+    struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    bind_addr.sin_port = htons(0);
+
+    if (bind(transfer_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+        close(transfer_sock);
+        return;
+    }
+
+    if (set_socket_timeout(transfer_sock, TFTP_TIMEOUT_SEC) < 0) {
+        close(transfer_sock);
+        return;
+    }
+
+    if (req->opcode == TFTP_RRQ) {
+        handle_rrq(transfer_sock, client_addr, client_len, path);
+    } else {
+        handle_wrq(transfer_sock, client_addr, client_len, path);
+    }
+
+    close(transfer_sock);
+}
+
+int main(int argc, char *argv[]) {
+    const char *root_dir = "./data";
+    uint16_t listen_port = TFTP_PORT;
+
+    if (argc > 3) {
+        fprintf(stderr, "Usage: %s [root_dir] [port]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    if (argc >= 2) {
+        root_dir = argv[1];
+    }
+    if (argc == 3 && parse_port(argv[2], &listen_port) < 0) {
+        fprintf(stderr, "Invalid port: %s\n", argv[2]);
+        return EXIT_FAILURE;
+    }
+
+    if (mkdir(root_dir, 0755) < 0 && errno != EEXIST) {
+        perror("mkdir");
+        return EXIT_FAILURE;
+    }
+
+    struct sigaction sa_term;
+    memset(&sa_term, 0, sizeof(sa_term));
+    sa_term.sa_handler = handle_signal;
+    sigemptyset(&sa_term.sa_mask);
+    sigaction(SIGINT, &sa_term, NULL);
+    sigaction(SIGTERM, &sa_term, NULL);
+
+    struct sigaction sa_chld;
+    memset(&sa_chld, 0, sizeof(sa_chld));
+    sa_chld.sa_handler = reap_children;
+    sa_chld.sa_flags = SA_RESTART;
+    sigemptyset(&sa_chld.sa_mask);
+    sigaction(SIGCHLD, &sa_chld, NULL);
+
+    int server_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (server_sock < 0) {
+        perror("socket");
+        return EXIT_FAILURE;
+    }
+
+    int opt = 1;
+    if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt");
+        close(server_sock);
+        return EXIT_FAILURE;
+    }
+
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_addr.sin_port = htons(listen_port);
+
+    if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("bind");
+        fprintf(stderr, "Binding UDP port %u may require additional privileges.\n", listen_port);
+        close(server_sock);
+        return EXIT_FAILURE;
+    }
+
+    fprintf(stderr, "TFTP server listening on udp/%u, root directory: %s\n", listen_port, root_dir);
+
+    while (g_running) {
+        uint8_t packet[TFTP_PACKET_SIZE];
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+
+        ssize_t packet_len = recvfrom(
+            server_sock,
+            packet,
+            sizeof(packet),
+            0,
+            (struct sockaddr *)&client_addr,
+            &client_len
+        );
+
+        if (packet_len < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("recvfrom");
+            break;
+        }
+
+        struct request_info req;
+        int parse_status = parse_request(packet, packet_len, &req);
+        if (parse_status == -2) {
+            send_error_packet(server_sock, &client_addr, client_len, TFTP_ERR_ILLEGAL_OP, "Only octet mode is supported");
+            log_client(&client_addr, "rejected request with unsupported mode");
+            continue;
+        }
+        if (parse_status < 0) {
+            send_error_packet(server_sock, &client_addr, client_len, TFTP_ERR_ILLEGAL_OP, "Malformed request");
+            log_client(&client_addr, "rejected malformed request");
+            continue;
+        }
+
+        if (!is_safe_filename(req.filename)) {
+            send_error_packet(server_sock, &client_addr, client_len, TFTP_ERR_ACCESS, "Unsafe filename");
+            log_client(&client_addr, "rejected unsafe filename");
+            continue;
+        }
+
+        char path[512];
+        if (build_path(path, sizeof(path), root_dir, req.filename) < 0) {
+            send_error_packet(server_sock, &client_addr, client_len, TFTP_ERR_ACCESS, "Path too long");
+            log_client(&client_addr, "rejected overlong path");
+            continue;
+        }
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            continue;
+        }
+
+        if (pid == 0) {
+            close(server_sock);
+            handle_request(&req, &client_addr, client_len, path);
+            _exit(EXIT_SUCCESS);
+        }
+
+        char message[320];
+        snprintf(message, sizeof(message), "accepted %s for %s", req.opcode == TFTP_RRQ ? "RRQ" : "WRQ", req.filename);
+        log_client(&client_addr, message);
+    }
+
+    close(server_sock);
+    return EXIT_SUCCESS;
+}
