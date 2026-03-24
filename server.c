@@ -19,10 +19,14 @@
 #include <unistd.h>
 
 #define TFTP_PORT 69
-#define TFTP_DATA_SIZE 512
-#define TFTP_PACKET_SIZE 516
+#define TFTP_DEFAULT_DATA_SIZE 512
+#define TFTP_CONTROL_PACKET_SIZE 516
+#define TFTP_REQUEST_PACKET_SIZE 2048
+#define TFTP_OACK_PACKET_SIZE 512
+#define TFTP_MIN_BLKSIZE 8
+#define TFTP_MAX_BLKSIZE 65464
 #define TFTP_RETRIES 5
-#define TFTP_TIMEOUT_SEC 3
+#define TFTP_DEFAULT_TIMEOUT_SEC 3
 
 enum tftp_opcode {
     TFTP_RRQ = 1,
@@ -30,6 +34,7 @@ enum tftp_opcode {
     TFTP_DATA = 3,
     TFTP_ACK = 4,
     TFTP_ERROR = 5,
+    TFTP_OACK = 6,
 };
 
 enum tftp_error_code {
@@ -47,6 +52,12 @@ struct request_info {
     uint16_t opcode;
     char filename[256];
     char mode[32];
+    bool has_tsize;
+    uint64_t tsize;
+    bool has_blksize;
+    uint16_t blksize;
+    bool has_timeout;
+    uint8_t timeout;
 };
 
 static volatile sig_atomic_t g_running = 1;
@@ -107,15 +118,23 @@ static void log_client(const struct sockaddr_in *addr, const char *message) {
 struct transfer_meter {
     const char *direction;
     const char *filename;
-    off_t total_bytes;
-    size_t transferred_bytes;
-    size_t next_report_bytes;
+    bool has_total_bytes;
+    uint64_t total_bytes;
+    uint64_t transferred_bytes;
+    uint64_t next_report_bytes;
     unsigned next_report_percent;
 };
 
-static void init_transfer_meter(struct transfer_meter *meter, const char *direction, const char *filename, off_t total_bytes) {
+static void init_transfer_meter(
+    struct transfer_meter *meter,
+    const char *direction,
+    const char *filename,
+    bool has_total_bytes,
+    uint64_t total_bytes
+) {
     meter->direction = direction;
     meter->filename = filename;
+    meter->has_total_bytes = has_total_bytes;
     meter->total_bytes = total_bytes;
     meter->transferred_bytes = 0;
     meter->next_report_bytes = 64 * 1024;
@@ -129,7 +148,7 @@ static void log_transfer_progress(const struct sockaddr_in *addr, struct transfe
 
     bool should_log = done;
     unsigned long long percent = 0;
-    if (meter->total_bytes > 0) {
+    if (meter->has_total_bytes && meter->total_bytes > 0) {
         percent = (unsigned long long)(((uint64_t)meter->transferred_bytes * 100) / (uint64_t)meter->total_bytes);
         if (percent > 100) {
             percent = 100;
@@ -152,15 +171,15 @@ static void log_transfer_progress(const struct sockaddr_in *addr, struct transfe
         return;
     }
 
-    if (meter->total_bytes > 0) {
+    if (meter->has_total_bytes) {
         snprintf(
             message,
             sizeof(message),
-            "%s progress for %s: %zu/%lld bytes (%llu%%)%s",
+            "%s progress for %s: %llu/%llu bytes (%llu%%)%s",
             meter->direction,
             meter->filename,
-            meter->transferred_bytes,
-            (long long)meter->total_bytes,
+            (unsigned long long)meter->transferred_bytes,
+            (unsigned long long)meter->total_bytes,
             percent,
             done ? ", completed" : ""
         );
@@ -168,10 +187,10 @@ static void log_transfer_progress(const struct sockaddr_in *addr, struct transfe
         snprintf(
             message,
             sizeof(message),
-            "%s progress for %s: %zu bytes%s",
+            "%s progress for %s: %llu bytes%s",
             meter->direction,
             meter->filename,
-            meter->transferred_bytes,
+            (unsigned long long)meter->transferred_bytes,
             done ? ", completed" : ""
         );
     }
@@ -235,8 +254,8 @@ static ssize_t send_error_packet(
     uint16_t error_code,
     const char *message
 ) {
-    uint8_t packet[TFTP_PACKET_SIZE];
-    size_t msg_len = bounded_strlen(message, TFTP_PACKET_SIZE - 5);
+    uint8_t packet[TFTP_CONTROL_PACKET_SIZE];
+    size_t msg_len = bounded_strlen(message, TFTP_CONTROL_PACKET_SIZE - 5);
 
     write_u16(packet, TFTP_ERROR);
     write_u16(packet + 2, error_code);
@@ -255,6 +274,156 @@ static int set_socket_timeout(int sockfd, int seconds) {
         return -1;
     }
 
+    return 0;
+}
+
+static int parse_u64(const char *text, uint64_t *value) {
+    char *end = NULL;
+    unsigned long long parsed;
+
+    if (text[0] == '\0') {
+        return -1;
+    }
+
+    errno = 0;
+    parsed = strtoull(text, &end, 10);
+    if (errno != 0 || end == NULL || *end != '\0') {
+        return -1;
+    }
+
+    *value = (uint64_t)parsed;
+    return 0;
+}
+
+static int append_oack_option(
+    uint8_t *packet,
+    size_t packet_size,
+    size_t *offset,
+    const char *option,
+    const char *value
+) {
+    size_t option_len = strlen(option) + 1;
+    size_t value_len = strlen(value) + 1;
+
+    if (*offset + option_len + value_len > packet_size) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+
+    memcpy(packet + *offset, option, option_len);
+    *offset += option_len;
+    memcpy(packet + *offset, value, value_len);
+    *offset += value_len;
+    return 0;
+}
+
+static ssize_t send_oack_packet(
+    int sockfd,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    const uint8_t *packet,
+    size_t packet_len
+) {
+    return sendto(sockfd, packet, packet_len, 0, (const struct sockaddr *)client_addr, client_len);
+}
+
+static int maybe_accept_options_for_rrq(
+    const struct request_info *req,
+    bool has_total_bytes,
+    uint64_t total_bytes,
+    uint8_t *packet,
+    size_t packet_size,
+    size_t *packet_len,
+    size_t *block_size,
+    int *timeout_sec
+) {
+    char value[32];
+    size_t offset = 2;
+    bool has_options = false;
+
+    *block_size = TFTP_DEFAULT_DATA_SIZE;
+    *timeout_sec = TFTP_DEFAULT_TIMEOUT_SEC;
+    write_u16(packet, TFTP_OACK);
+
+    if (req->has_tsize && has_total_bytes) {
+        snprintf(value, sizeof(value), "%llu", (unsigned long long)total_bytes);
+        if (append_oack_option(packet, packet_size, &offset, "tsize", value) < 0) {
+            return -1;
+        }
+        has_options = true;
+    }
+
+    if (req->has_blksize) {
+        snprintf(value, sizeof(value), "%u", req->blksize);
+        if (append_oack_option(packet, packet_size, &offset, "blksize", value) < 0) {
+            return -1;
+        }
+        *block_size = req->blksize;
+        has_options = true;
+    }
+
+    if (req->has_timeout) {
+        snprintf(value, sizeof(value), "%u", req->timeout);
+        if (append_oack_option(packet, packet_size, &offset, "timeout", value) < 0) {
+            return -1;
+        }
+        *timeout_sec = req->timeout;
+        has_options = true;
+    }
+
+    *packet_len = has_options ? offset : 0;
+    return 0;
+}
+
+static int maybe_accept_options_for_wrq(
+    const struct request_info *req,
+    uint8_t *packet,
+    size_t packet_size,
+    size_t *packet_len,
+    size_t *block_size,
+    int *timeout_sec,
+    bool *has_total_bytes,
+    uint64_t *total_bytes
+) {
+    char value[32];
+    size_t offset = 2;
+    bool has_options = false;
+
+    *block_size = TFTP_DEFAULT_DATA_SIZE;
+    *timeout_sec = TFTP_DEFAULT_TIMEOUT_SEC;
+    *has_total_bytes = false;
+    *total_bytes = 0;
+    write_u16(packet, TFTP_OACK);
+
+    if (req->has_tsize) {
+        snprintf(value, sizeof(value), "%llu", (unsigned long long)req->tsize);
+        if (append_oack_option(packet, packet_size, &offset, "tsize", value) < 0) {
+            return -1;
+        }
+        *has_total_bytes = true;
+        *total_bytes = req->tsize;
+        has_options = true;
+    }
+
+    if (req->has_blksize) {
+        snprintf(value, sizeof(value), "%u", req->blksize);
+        if (append_oack_option(packet, packet_size, &offset, "blksize", value) < 0) {
+            return -1;
+        }
+        *block_size = req->blksize;
+        has_options = true;
+    }
+
+    if (req->has_timeout) {
+        snprintf(value, sizeof(value), "%u", req->timeout);
+        if (append_oack_option(packet, packet_size, &offset, "timeout", value) < 0) {
+            return -1;
+        }
+        *timeout_sec = req->timeout;
+        has_options = true;
+    }
+
+    *packet_len = has_options ? offset : 0;
     return 0;
 }
 
@@ -283,6 +452,8 @@ static int recv_expected_packet(
 }
 
 static int parse_request(const uint8_t *packet, ssize_t len, struct request_info *req) {
+    memset(req, 0, sizeof(*req));
+
     if (len < 4) {
         return -1;
     }
@@ -314,6 +485,58 @@ static int parse_request(const uint8_t *packet, ssize_t len, struct request_info
         return -2;
     }
 
+    index += mode_len + 1;
+
+    while (index < (size_t)len) {
+        char option[32];
+        char value[32];
+        uint64_t parsed = 0;
+        size_t option_len = bounded_strlen((const char *)(packet + index), (size_t)len - index);
+        if (option_len == 0 || index + option_len >= (size_t)len || option_len >= sizeof(option)) {
+            return -1;
+        }
+
+        memcpy(option, packet + index, option_len);
+        option[option_len] = '\0';
+        index += option_len + 1;
+
+        size_t value_len = bounded_strlen((const char *)(packet + index), (size_t)len - index);
+        if (value_len == 0 || index + value_len >= (size_t)len || value_len >= sizeof(value)) {
+            return -1;
+        }
+
+        memcpy(value, packet + index, value_len);
+        value[value_len] = '\0';
+        index += value_len + 1;
+
+        if (strcasecmp(option, "tsize") == 0) {
+            if (parse_u64(value, &parsed) < 0) {
+                return -1;
+            }
+            req->has_tsize = true;
+            req->tsize = parsed;
+            continue;
+        }
+
+        if (strcasecmp(option, "blksize") == 0) {
+            if (parse_u64(value, &parsed) < 0 || parsed < TFTP_MIN_BLKSIZE || parsed > TFTP_MAX_BLKSIZE) {
+                return -1;
+            }
+            req->has_blksize = true;
+            req->blksize = (uint16_t)parsed;
+            continue;
+        }
+
+        if (strcasecmp(option, "timeout") == 0) {
+            if (parse_u64(value, &parsed) < 0 || parsed == 0 || parsed > UINT8_MAX) {
+                return -1;
+            }
+            req->has_timeout = true;
+            req->timeout = (uint8_t)parsed;
+            continue;
+        }
+    }
+
     return 0;
 }
 
@@ -333,9 +556,15 @@ static int send_data(
     const uint8_t *data,
     size_t data_len
 ) {
-    uint8_t packet[TFTP_PACKET_SIZE];
-    if (data_len > TFTP_DATA_SIZE) {
+    uint8_t *packet = malloc(4 + data_len);
+    if (packet == NULL) {
+        errno = ENOMEM;
+        return -1;
+    }
+
+    if (data_len > TFTP_MAX_BLKSIZE) {
         errno = EINVAL;
+        free(packet);
         return -1;
     }
 
@@ -343,11 +572,14 @@ static int send_data(
     write_u16(packet + 2, block);
     memcpy(packet + 4, data, data_len);
 
-    return sendto(sockfd, packet, 4 + data_len, 0, (const struct sockaddr *)client_addr, client_len);
+    ssize_t sent = sendto(sockfd, packet, 4 + data_len, 0, (const struct sockaddr *)client_addr, client_len);
+    free(packet);
+    return sent;
 }
 
 static int handle_rrq(
     int sockfd,
+    const struct request_info *req,
     const struct sockaddr_in *client_addr,
     socklen_t client_len,
     const char *path,
@@ -363,35 +595,62 @@ static int handle_rrq(
         return -1;
     }
 
-    uint16_t block = 1;
-    uint8_t data[TFTP_DATA_SIZE];
-    uint8_t ack_packet[TFTP_PACKET_SIZE];
-    bool done = false;
     struct stat st;
-    off_t total_bytes = -1;
-    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
-        total_bytes = st.st_size;
+    bool has_total_bytes = false;
+    uint64_t total_bytes = 0;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0) {
+        has_total_bytes = true;
+        total_bytes = (uint64_t)st.st_size;
     }
+
+    uint8_t oack_packet[TFTP_OACK_PACKET_SIZE];
+    size_t oack_len = 0;
+    size_t block_size = TFTP_DEFAULT_DATA_SIZE;
+    int timeout_sec = TFTP_DEFAULT_TIMEOUT_SEC;
+    if (maybe_accept_options_for_rrq(
+            req,
+            has_total_bytes,
+            total_bytes,
+            oack_packet,
+            sizeof(oack_packet),
+            &oack_len,
+            &block_size,
+            &timeout_sec
+        ) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    if (set_socket_timeout(sockfd, timeout_sec) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    uint8_t *data = malloc(block_size);
+    uint8_t *ack_packet = malloc(block_size + 4);
+    if (data == NULL || ack_packet == NULL) {
+        free(data);
+        free(ack_packet);
+        close(fd);
+        errno = ENOMEM;
+        return -1;
+    }
+
     struct transfer_meter meter;
-    init_transfer_meter(&meter, "download", filename, total_bytes);
+    init_transfer_meter(&meter, "download", filename, has_total_bytes, total_bytes);
 
-    while (!done) {
-        ssize_t bytes_read = read(fd, data, sizeof(data));
-        if (bytes_read < 0) {
-            send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_UNDEFINED, "Read failure");
-            close(fd);
-            return -1;
-        }
-
+    if (oack_len > 0) {
         int retries = 0;
         while (retries < TFTP_RETRIES) {
-            if (send_data(sockfd, client_addr, client_len, block, data, (size_t)bytes_read) < 0) {
+            if (send_oack_packet(sockfd, client_addr, client_len, oack_packet, oack_len) < 0) {
+                free(data);
+                free(ack_packet);
                 close(fd);
                 return -1;
             }
 
             ssize_t recv_len = 0;
-            int recv_status = recv_expected_packet(sockfd, ack_packet, sizeof(ack_packet), &recv_len, client_addr);
+            int recv_status = recv_expected_packet(sockfd, ack_packet, block_size + 4, &recv_len, client_addr);
             if (recv_status == -2) {
                 continue;
             }
@@ -400,6 +659,66 @@ static int handle_rrq(
                     retries++;
                     continue;
                 }
+                free(data);
+                free(ack_packet);
+                close(fd);
+                return -1;
+            }
+
+            if (recv_len == 4 && read_u16(ack_packet) == TFTP_ACK && read_u16(ack_packet + 2) == 0) {
+                break;
+            }
+
+            if (recv_len >= 4 && read_u16(ack_packet) == TFTP_ERROR) {
+                free(data);
+                free(ack_packet);
+                close(fd);
+                return -1;
+            }
+        }
+
+        if (retries == TFTP_RETRIES) {
+            free(data);
+            free(ack_packet);
+            close(fd);
+            return -1;
+        }
+    }
+
+    uint16_t block = 1;
+    bool done = false;
+
+    while (!done) {
+        ssize_t bytes_read = read(fd, data, block_size);
+        if (bytes_read < 0) {
+            send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_UNDEFINED, "Read failure");
+            free(data);
+            free(ack_packet);
+            close(fd);
+            return -1;
+        }
+
+        int retries = 0;
+        while (retries < TFTP_RETRIES) {
+            if (send_data(sockfd, client_addr, client_len, block, data, (size_t)bytes_read) < 0) {
+                free(data);
+                free(ack_packet);
+                close(fd);
+                return -1;
+            }
+
+            ssize_t recv_len = 0;
+            int recv_status = recv_expected_packet(sockfd, ack_packet, block_size + 4, &recv_len, client_addr);
+            if (recv_status == -2) {
+                continue;
+            }
+            if (recv_status < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    retries++;
+                    continue;
+                }
+                free(data);
+                free(ack_packet);
                 close(fd);
                 return -1;
             }
@@ -409,27 +728,34 @@ static int handle_rrq(
             }
 
             if (recv_len >= 4 && read_u16(ack_packet) == TFTP_ERROR) {
+                free(data);
+                free(ack_packet);
                 close(fd);
                 return -1;
             }
         }
 
         if (retries == TFTP_RETRIES) {
+            free(data);
+            free(ack_packet);
             close(fd);
             return -1;
         }
 
-        done = bytes_read < TFTP_DATA_SIZE;
+        done = (size_t)bytes_read < block_size;
         log_transfer_progress(client_addr, &meter, (size_t)bytes_read, done);
         block++;
     }
 
+    free(data);
+    free(ack_packet);
     close(fd);
     return 0;
 }
 
 static int handle_wrq(
     int sockfd,
+    const struct request_info *req,
     const struct sockaddr_in *client_addr,
     socklen_t client_len,
     const char *path,
@@ -442,29 +768,77 @@ static int handle_wrq(
         return -1;
     }
 
-    if (send_ack(sockfd, client_addr, client_len, 0) < 0) {
+    uint8_t oack_packet[TFTP_OACK_PACKET_SIZE];
+    size_t oack_len = 0;
+    size_t block_size = TFTP_DEFAULT_DATA_SIZE;
+    int timeout_sec = TFTP_DEFAULT_TIMEOUT_SEC;
+    bool has_total_bytes = false;
+    uint64_t total_bytes = 0;
+    if (maybe_accept_options_for_wrq(
+            req,
+            oack_packet,
+            sizeof(oack_packet),
+            &oack_len,
+            &block_size,
+            &timeout_sec,
+            &has_total_bytes,
+            &total_bytes
+        ) < 0) {
+        close(fd);
+        unlink(temp_path);
+        return -1;
+    }
+
+    if (set_socket_timeout(sockfd, timeout_sec) < 0) {
+        close(fd);
+        unlink(temp_path);
+        return -1;
+    }
+
+    if (oack_len > 0) {
+        if (send_oack_packet(sockfd, client_addr, client_len, oack_packet, oack_len) < 0) {
+            close(fd);
+            unlink(temp_path);
+            return -1;
+        }
+    } else if (send_ack(sockfd, client_addr, client_len, 0) < 0) {
         close(fd);
         unlink(temp_path);
         return -1;
     }
 
     uint16_t expected_block = 1;
-    uint8_t packet[TFTP_PACKET_SIZE];
+    uint8_t *packet = malloc(block_size + 4);
+    if (packet == NULL) {
+        close(fd);
+        unlink(temp_path);
+        errno = ENOMEM;
+        return -1;
+    }
+
     struct transfer_meter meter;
-    init_transfer_meter(&meter, "upload", filename, -1);
+    init_transfer_meter(&meter, "upload", filename, has_total_bytes, total_bytes);
 
     for (;;) {
         int retries = 0;
         ssize_t recv_len = 0;
 
         while (retries < TFTP_RETRIES) {
-            int recv_status = recv_expected_packet(sockfd, packet, sizeof(packet), &recv_len, client_addr);
+            int recv_status = recv_expected_packet(sockfd, packet, block_size + 4, &recv_len, client_addr);
             if (recv_status == -2) {
                 continue;
             }
             if (recv_status < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    if (send_ack(sockfd, client_addr, client_len, (uint16_t)(expected_block - 1)) < 0) {
+                    if (oack_len > 0 && expected_block == 1) {
+                        if (send_oack_packet(sockfd, client_addr, client_len, oack_packet, oack_len) < 0) {
+                            free(packet);
+                            close(fd);
+                            unlink(temp_path);
+                            return -1;
+                        }
+                    } else if (send_ack(sockfd, client_addr, client_len, (uint16_t)(expected_block - 1)) < 0) {
+                        free(packet);
                         close(fd);
                         unlink(temp_path);
                         return -1;
@@ -472,6 +846,7 @@ static int handle_wrq(
                     retries++;
                     continue;
                 }
+                free(packet);
                 close(fd);
                 unlink(temp_path);
                 return -1;
@@ -481,6 +856,7 @@ static int handle_wrq(
         }
 
         if (retries == TFTP_RETRIES) {
+            free(packet);
             close(fd);
             unlink(temp_path);
             return -1;
@@ -488,6 +864,7 @@ static int handle_wrq(
 
         if (recv_len < 4 || read_u16(packet) != TFTP_DATA) {
             send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_ILLEGAL_OP, "Expected DATA packet");
+            free(packet);
             close(fd);
             unlink(temp_path);
             return -1;
@@ -498,13 +875,15 @@ static int handle_wrq(
             ssize_t data_len = recv_len - 4;
             if (write(fd, packet + 4, (size_t)data_len) != data_len) {
                 send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_DISK_FULL, "Write failure");
+                free(packet);
                 close(fd);
                 unlink(temp_path);
                 return -1;
             }
 
-            if (data_len < TFTP_DATA_SIZE) {
+            if ((size_t)data_len < block_size) {
                 if (close(fd) < 0) {
+                    free(packet);
                     unlink(temp_path);
                     return -1;
                 }
@@ -512,11 +891,13 @@ static int handle_wrq(
 
                 if (rename(temp_path, path) < 0) {
                     send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_ACCESS, "Unable to replace target file");
+                    free(packet);
                     unlink(temp_path);
                     return -1;
                 }
 
                 if (send_ack(sockfd, client_addr, client_len, block) < 0) {
+                    free(packet);
                     return -1;
                 }
 
@@ -525,6 +906,7 @@ static int handle_wrq(
             }
 
             if (send_ack(sockfd, client_addr, client_len, block) < 0) {
+                free(packet);
                 close(fd);
                 unlink(temp_path);
                 return -1;
@@ -537,6 +919,7 @@ static int handle_wrq(
 
         if (block == (uint16_t)(expected_block - 1)) {
             if (send_ack(sockfd, client_addr, client_len, block) < 0) {
+                free(packet);
                 close(fd);
                 unlink(temp_path);
                 return -1;
@@ -545,6 +928,7 @@ static int handle_wrq(
         }
 
         send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_ILLEGAL_OP, "Unexpected block number");
+        free(packet);
         close(fd);
         unlink(temp_path);
         return -1;
@@ -553,6 +937,7 @@ static int handle_wrq(
     if (fd >= 0) {
         close(fd);
     }
+    free(packet);
     return 0;
 }
 
@@ -578,15 +963,15 @@ static void handle_request(
         return;
     }
 
-    if (set_socket_timeout(transfer_sock, TFTP_TIMEOUT_SEC) < 0) {
+    if (set_socket_timeout(transfer_sock, TFTP_DEFAULT_TIMEOUT_SEC) < 0) {
         close(transfer_sock);
         return;
     }
 
     if (req->opcode == TFTP_RRQ) {
-        handle_rrq(transfer_sock, client_addr, client_len, path, req->filename);
+        handle_rrq(transfer_sock, req, client_addr, client_len, path, req->filename);
     } else {
-        handle_wrq(transfer_sock, client_addr, client_len, path, req->filename);
+        handle_wrq(transfer_sock, req, client_addr, client_len, path, req->filename);
     }
 
     close(transfer_sock);
@@ -656,7 +1041,7 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "TFTP server listening on udp/%u, root directory: %s\n", listen_port, root_dir);
 
     while (g_running) {
-        uint8_t packet[TFTP_PACKET_SIZE];
+        uint8_t packet[TFTP_REQUEST_PACKET_SIZE];
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
 
