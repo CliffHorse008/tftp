@@ -45,11 +45,54 @@ def recv_packet(sock: socket.socket) -> tuple[bytes, tuple[str, int]]:
         return data, addr
 
 
-def tftp_put(host: str, port: int, remote_name: str, payload: bytes) -> str:
+def encode_netascii(payload: bytes) -> bytes:
+    encoded = bytearray()
+    for byte in payload:
+        if byte == 0x0A:
+            encoded.extend(b"\r\n")
+        elif byte == 0x0D:
+            encoded.extend(b"\r\0")
+        else:
+            encoded.append(byte)
+    return bytes(encoded)
+
+
+def decode_netascii(payload: bytes) -> bytes:
+    decoded = bytearray()
+    index = 0
+    while index < len(payload):
+        byte = payload[index]
+        if byte != 0x0D:
+            decoded.append(byte)
+            index += 1
+            continue
+
+        if index + 1 >= len(payload):
+            decoded.append(0x0D)
+            break
+
+        nxt = payload[index + 1]
+        if nxt == 0x0A:
+            decoded.append(0x0A)
+            index += 2
+            continue
+        if nxt == 0x00:
+            decoded.append(0x0D)
+            index += 2
+            continue
+
+        decoded.append(0x0D)
+        index += 1
+
+    return bytes(decoded)
+
+
+def tftp_put(host: str, port: int, remote_name: str, payload: bytes, mode: str = "octet") -> str:
     digest = hashlib.sha256(payload).hexdigest()
+    wire_payload = encode_netascii(payload) if mode == "netascii" else payload
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.settimeout(TIMEOUT_SEC)
-        sock.sendto(packet_request(OP_WRQ, remote_name), (host, port))
+        sock.sendto(packet_request(OP_WRQ, remote_name, mode), (host, port))
 
         data, server_addr = recv_packet(sock)
         if len(data) != 4 or int.from_bytes(data[:2], "big") != OP_ACK or int.from_bytes(data[2:4], "big") != 0:
@@ -58,7 +101,7 @@ def tftp_put(host: str, port: int, remote_name: str, payload: bytes) -> str:
         block = 1
         offset = 0
         while True:
-            chunk = payload[offset:offset + BLOCK_SIZE]
+            chunk = wire_payload[offset:offset + BLOCK_SIZE]
             sock.sendto(packet_data(block, chunk), server_addr)
             data, addr = recv_packet(sock)
             if addr != server_addr:
@@ -76,10 +119,10 @@ def tftp_put(host: str, port: int, remote_name: str, payload: bytes) -> str:
     return digest
 
 
-def tftp_get(host: str, port: int, remote_name: str) -> bytes:
+def tftp_get(host: str, port: int, remote_name: str, mode: str = "octet") -> bytes:
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.settimeout(TIMEOUT_SEC)
-        sock.sendto(packet_request(OP_RRQ, remote_name), (host, port))
+        sock.sendto(packet_request(OP_RRQ, remote_name, mode), (host, port))
 
         expected_block = 1
         chunks: list[bytes] = []
@@ -102,7 +145,8 @@ def tftp_get(host: str, port: int, remote_name: str) -> bytes:
             sock.sendto(packet_ack(block), server_addr)
 
             if len(payload) < BLOCK_SIZE:
-                return b"".join(chunks)
+                joined = b"".join(chunks)
+                return decode_netascii(joined) if mode == "netascii" else joined
 
             expected_block = (expected_block + 1) & 0xFFFF
             if expected_block == 0:
@@ -220,6 +264,17 @@ def main() -> int:
         if downloaded_payload != replacement_payload:
             raise RuntimeError("overwrite verification failed for downloaded file")
 
+        netascii_name = "netascii_sample.txt"
+        netascii_payload = b"line1\nline2\rline3\r\nline4\n"
+        netascii_digest = tftp_put("127.0.0.1", args.port, netascii_name, netascii_payload, mode="netascii")
+        actual_netascii = (root_dir / netascii_name).read_bytes()
+        if hashlib.sha256(actual_netascii).hexdigest() != netascii_digest:
+            raise RuntimeError("netascii upload verification failed for stored file")
+
+        downloaded_netascii = tftp_get("127.0.0.1", args.port, netascii_name, mode="netascii")
+        if downloaded_netascii != netascii_payload:
+            raise RuntimeError("netascii download verification failed")
+
         total_bytes = (args.uploads + args.downloads) * args.size
         rate_mib = total_bytes / duration / (1024 * 1024)
         print(
@@ -229,7 +284,8 @@ def main() -> int:
             f"size={args.size} "
             f"duration_sec={duration:.3f} "
             f"throughput_mib_s={rate_mib:.2f} "
-            "overwrite=ok"
+            "overwrite=ok "
+            "netascii=ok"
         )
         return 0
     finally:

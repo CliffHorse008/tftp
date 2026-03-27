@@ -27,6 +27,7 @@
 #define TFTP_MAX_BLKSIZE 65464
 #define TFTP_RETRIES 5
 #define TFTP_DEFAULT_TIMEOUT_SEC 3
+#define NETASCII_BUFFER_SIZE 4096
 
 enum tftp_opcode {
     TFTP_RRQ = 1,
@@ -61,6 +62,18 @@ struct request_info {
 };
 
 static volatile sig_atomic_t g_running = 1;
+
+struct netascii_encode_state {
+    uint8_t input[NETASCII_BUFFER_SIZE];
+    size_t input_len;
+    size_t input_pos;
+    int pending_byte;
+    bool eof;
+};
+
+struct netascii_decode_state {
+    bool pending_cr;
+};
 
 static int parse_port(const char *text, uint16_t *port) {
     char *end = NULL;
@@ -113,6 +126,165 @@ static void log_client(const struct sockaddr_in *addr, const char *message) {
     }
 
     fprintf(stderr, "[%s:%u] %s\n", ip, ntohs(addr->sin_port), message);
+}
+
+static bool request_uses_netascii(const struct request_info *req) {
+    return strcasecmp(req->mode, "netascii") == 0;
+}
+
+static int write_all(int fd, const uint8_t *buf, size_t len) {
+    size_t written = 0;
+    while (written < len) {
+        ssize_t chunk = write(fd, buf + written, len - written);
+        if (chunk < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        written += (size_t)chunk;
+    }
+
+    return 0;
+}
+
+static void init_netascii_encode_state(struct netascii_encode_state *state) {
+    memset(state, 0, sizeof(*state));
+    state->pending_byte = -1;
+}
+
+static ssize_t read_netascii_block(
+    int fd,
+    struct netascii_encode_state *state,
+    uint8_t *out,
+    size_t out_cap
+) {
+    size_t out_len = 0;
+
+    while (out_len < out_cap) {
+        if (state->pending_byte >= 0) {
+            out[out_len++] = (uint8_t)state->pending_byte;
+            state->pending_byte = -1;
+            continue;
+        }
+
+        if (state->input_pos == state->input_len) {
+            if (state->eof) {
+                break;
+            }
+
+            ssize_t bytes_read = read(fd, state->input, sizeof(state->input));
+            if (bytes_read < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return -1;
+            }
+            if (bytes_read == 0) {
+                state->eof = true;
+                break;
+            }
+
+            state->input_len = (size_t)bytes_read;
+            state->input_pos = 0;
+        }
+
+        uint8_t ch = state->input[state->input_pos++];
+        if (ch == '\n') {
+            out[out_len++] = '\r';
+            if (out_len < out_cap) {
+                out[out_len++] = '\n';
+            } else {
+                state->pending_byte = '\n';
+            }
+            continue;
+        }
+
+        if (ch == '\r') {
+            out[out_len++] = '\r';
+            if (out_len < out_cap) {
+                out[out_len++] = '\0';
+            } else {
+                state->pending_byte = '\0';
+            }
+            continue;
+        }
+
+        out[out_len++] = ch;
+    }
+
+    return (ssize_t)out_len;
+}
+
+static ssize_t decode_netascii_chunk(
+    struct netascii_decode_state *state,
+    const uint8_t *input,
+    size_t input_len,
+    bool final_chunk,
+    uint8_t *output,
+    size_t output_cap
+) {
+    size_t out_len = 0;
+
+    for (size_t i = 0; i < input_len; i++) {
+        uint8_t ch = input[i];
+
+        if (!state->pending_cr) {
+            if (ch == '\r') {
+                state->pending_cr = true;
+                continue;
+            }
+
+            if (out_len >= output_cap) {
+                errno = EOVERFLOW;
+                return -1;
+            }
+            output[out_len++] = ch;
+            continue;
+        }
+
+        if (out_len >= output_cap) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+
+        if (ch == '\n') {
+            output[out_len++] = '\n';
+            state->pending_cr = false;
+            continue;
+        }
+
+        if (ch == '\0') {
+            output[out_len++] = '\r';
+            state->pending_cr = false;
+            continue;
+        }
+
+        output[out_len++] = '\r';
+        state->pending_cr = false;
+
+        if (ch == '\r') {
+            state->pending_cr = true;
+            continue;
+        }
+
+        if (out_len >= output_cap) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        output[out_len++] = ch;
+    }
+
+    if (final_chunk && state->pending_cr) {
+        if (out_len >= output_cap) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        output[out_len++] = '\r';
+        state->pending_cr = false;
+    }
+
+    return (ssize_t)out_len;
 }
 
 struct transfer_meter {
@@ -481,7 +653,7 @@ static int parse_request(const uint8_t *packet, ssize_t len, struct request_info
     memcpy(req->mode, packet + index, mode_len);
     req->mode[mode_len] = '\0';
 
-    if (strcasecmp(req->mode, "octet") != 0) {
+    if (strcasecmp(req->mode, "octet") != 0 && strcasecmp(req->mode, "netascii") != 0) {
         return -2;
     }
 
@@ -638,6 +810,11 @@ static int handle_rrq(
 
     struct transfer_meter meter;
     init_transfer_meter(&meter, "download", filename, has_total_bytes, total_bytes);
+    bool use_netascii = request_uses_netascii(req);
+    struct netascii_encode_state netascii_state;
+    if (use_netascii) {
+        init_netascii_encode_state(&netascii_state);
+    }
 
     if (oack_len > 0) {
         int retries = 0;
@@ -689,7 +866,9 @@ static int handle_rrq(
     bool done = false;
 
     while (!done) {
-        ssize_t bytes_read = read(fd, data, block_size);
+        ssize_t bytes_read = use_netascii
+            ? read_netascii_block(fd, &netascii_state, data, block_size)
+            : read(fd, data, block_size);
         if (bytes_read < 0) {
             send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_UNDEFINED, "Read failure");
             free(data);
@@ -809,11 +988,25 @@ static int handle_wrq(
 
     uint16_t expected_block = 1;
     uint8_t *packet = malloc(block_size + 4);
+    uint8_t *decoded = NULL;
     if (packet == NULL) {
         close(fd);
         unlink(temp_path);
         errno = ENOMEM;
         return -1;
+    }
+
+    bool use_netascii = request_uses_netascii(req);
+    struct netascii_decode_state netascii_state = {0};
+    if (use_netascii) {
+        decoded = malloc(block_size + 1);
+        if (decoded == NULL) {
+            free(packet);
+            close(fd);
+            unlink(temp_path);
+            errno = ENOMEM;
+            return -1;
+        }
     }
 
     struct transfer_meter meter;
@@ -856,6 +1049,7 @@ static int handle_wrq(
         }
 
         if (retries == TFTP_RETRIES) {
+            free(decoded);
             free(packet);
             close(fd);
             unlink(temp_path);
@@ -864,6 +1058,7 @@ static int handle_wrq(
 
         if (recv_len < 4 || read_u16(packet) != TFTP_DATA) {
             send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_ILLEGAL_OP, "Expected DATA packet");
+            free(decoded);
             free(packet);
             close(fd);
             unlink(temp_path);
@@ -873,8 +1068,33 @@ static int handle_wrq(
         uint16_t block = read_u16(packet + 2);
         if (block == expected_block) {
             ssize_t data_len = recv_len - 4;
-            if (write(fd, packet + 4, (size_t)data_len) != data_len) {
+            const uint8_t *to_write = packet + 4;
+            size_t write_len = (size_t)data_len;
+
+            if (use_netascii) {
+                ssize_t decoded_len = decode_netascii_chunk(
+                    &netascii_state,
+                    packet + 4,
+                    (size_t)data_len,
+                    (size_t)data_len < block_size,
+                    decoded,
+                    block_size + 1
+                );
+                if (decoded_len < 0) {
+                    send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_UNDEFINED, "Netascii decode failure");
+                    free(decoded);
+                    free(packet);
+                    close(fd);
+                    unlink(temp_path);
+                    return -1;
+                }
+                to_write = decoded;
+                write_len = (size_t)decoded_len;
+            }
+
+            if (write_all(fd, to_write, write_len) < 0) {
                 send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_DISK_FULL, "Write failure");
+                free(decoded);
                 free(packet);
                 close(fd);
                 unlink(temp_path);
@@ -883,6 +1103,7 @@ static int handle_wrq(
 
             if ((size_t)data_len < block_size) {
                 if (close(fd) < 0) {
+                    free(decoded);
                     free(packet);
                     unlink(temp_path);
                     return -1;
@@ -891,34 +1112,38 @@ static int handle_wrq(
 
                 if (rename(temp_path, path) < 0) {
                     send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_ACCESS, "Unable to replace target file");
+                    free(decoded);
                     free(packet);
                     unlink(temp_path);
                     return -1;
                 }
 
                 if (send_ack(sockfd, client_addr, client_len, block) < 0) {
+                    free(decoded);
                     free(packet);
                     return -1;
                 }
 
-                log_transfer_progress(client_addr, &meter, (size_t)data_len, true);
+                log_transfer_progress(client_addr, &meter, write_len, true);
                 break;
             }
 
             if (send_ack(sockfd, client_addr, client_len, block) < 0) {
+                free(decoded);
                 free(packet);
                 close(fd);
                 unlink(temp_path);
                 return -1;
             }
 
-            log_transfer_progress(client_addr, &meter, (size_t)data_len, false);
+            log_transfer_progress(client_addr, &meter, write_len, false);
             expected_block++;
             continue;
         }
 
         if (block == (uint16_t)(expected_block - 1)) {
             if (send_ack(sockfd, client_addr, client_len, block) < 0) {
+                free(decoded);
                 free(packet);
                 close(fd);
                 unlink(temp_path);
@@ -928,6 +1153,7 @@ static int handle_wrq(
         }
 
         send_error_packet(sockfd, client_addr, client_len, TFTP_ERR_ILLEGAL_OP, "Unexpected block number");
+        free(decoded);
         free(packet);
         close(fd);
         unlink(temp_path);
@@ -937,6 +1163,7 @@ static int handle_wrq(
     if (fd >= 0) {
         close(fd);
     }
+    free(decoded);
     free(packet);
     return 0;
 }
@@ -1065,7 +1292,7 @@ int main(int argc, char *argv[]) {
         struct request_info req;
         int parse_status = parse_request(packet, packet_len, &req);
         if (parse_status == -2) {
-            send_error_packet(server_sock, &client_addr, client_len, TFTP_ERR_ILLEGAL_OP, "Only octet mode is supported");
+            send_error_packet(server_sock, &client_addr, client_len, TFTP_ERR_ILLEGAL_OP, "Supported modes: octet, netascii");
             log_client(&client_addr, "rejected request with unsupported mode");
             continue;
         }
